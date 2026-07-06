@@ -15,3 +15,6 @@
 
 [functions."ocr"]
   timeout = 26
+
+[functions."ocr-status"]
+  timeout = 26

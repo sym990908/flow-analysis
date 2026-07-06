@@ -3,7 +3,7 @@ import { ArrowLeft, Download, FileJson, AlertCircle } from 'lucide-react'
 import { v4 as uuidv4 } from 'uuid'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { useApp } from '../../store/AppContext'
-import { ocrPageBlob, ocrPagesBatch, OCR_RETRY_SCALES, parseTransactions, inferTableSchema, type OcrBatchProgress, type OcrPageResult } from '../../lib/api'
+import { ocrPageBlob, OCR_PDF_RETRY_RENDER_SCALE, parseTransactions, inferTableSchema, type OcrBatchProgress, type OcrPageResult } from '../../lib/api'
 import {
   loadPdfDocument,
   getCachedPdf,
@@ -15,6 +15,8 @@ import {
   renderImageThumbnail,
   mapBboxToPreview,
   PDF_NATIVE_SCALE,
+  OCR_RETRY_MAX_LONG_EDGE,
+  OCR_RETRY_MAX_BYTES,
 } from '../../lib/pdfUtils'
 import { exportOcrBlocksCsv, exportOcrJson, exportStatementTableCsv, exportStatementTableExcel } from '../../lib/ocrExport'
 import { getCachedFile } from '../../lib/fileCache'
@@ -214,7 +216,10 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
     })
   }, [mediaReady, renderCurrentPage])
 
-  const renderPageForOcr = async (pageIndex: number, options?: { forceScale?: number }) => {
+  const renderPageForOcr = async (
+    pageIndex: number,
+    options?: { pdfRenderScale?: number; forceScale?: number; isRetry?: boolean },
+  ) => {
     const page = doc.pages[pageIndex]
     const file = sourceFileRef.current
     let canvas: HTMLCanvasElement
@@ -225,7 +230,7 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
         pdfRef.current,
         pageIndex,
         page.rotation,
-        PDF_NATIVE_SCALE,
+        options?.pdfRenderScale ?? PDF_NATIVE_SCALE,
         doc.fileId,
       )
       canvas = result.canvas
@@ -236,11 +241,21 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
       throw new Error('无法渲染页面：缺少源文件')
     }
 
+    const prepareOptions = options?.isRetry
+      ? {
+          maxLongEdge: OCR_RETRY_MAX_LONG_EDGE,
+          maxBytes: OCR_RETRY_MAX_BYTES,
+          ...(options?.forceScale != null ? { forceScale: options.forceScale } : {}),
+        }
+      : options?.forceScale != null
+        ? { forceScale: options.forceScale }
+        : undefined
+
     const payload = await prepareCanvasForOcr(
       canvas,
       `${doc.fileName}-page-${pageIndex + 1}.jpg`,
       undefined,
-      options,
+      prepareOptions,
     )
 
     return { pageIndex, payload, previewWidth: canvas.width, previewHeight: canvas.height }
@@ -250,30 +265,74 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
     pageIndex: number,
     firstError: Error,
   ): Promise<{ result: OcrPageResult; ocrWidth: number; ocrHeight: number } | { error: Error }> => {
-    let lastError = firstError
-
-    for (const forceScale of OCR_RETRY_SCALES) {
-      try {
-        const retryRendered = await renderPageForOcr(pageIndex, { forceScale })
-        const result = await ocrPageBlob(
-          retryRendered.payload.blob,
-          retryRendered.payload.filename,
-          retryRendered.payload.mimeType,
-        )
-        setCompressHint(
-          `识别失败页已按 ${Math.round(forceScale * 100)}% 分辨率重试成功，bbox 已同步映射`,
-        )
-        return {
-          result,
-          ocrWidth: retryRendered.payload.width,
-          ocrHeight: retryRendered.payload.height,
-        }
-      } catch (err) {
-        lastError = err instanceof Error ? err : lastError
-      }
+    if (doc.fileType !== 'pdf') {
+      return { error: firstError }
     }
 
-    return { error: lastError }
+    try {
+      console.info('[ocr] retry with 1x render', { pageIndex: pageIndex + 1, firstError: firstError.message })
+      const retryRendered = await renderPageForOcr(pageIndex, {
+        pdfRenderScale: OCR_PDF_RETRY_RENDER_SCALE,
+        isRetry: true,
+      })
+      const result = await ocrPageBlob(
+        retryRendered.payload.blob,
+        retryRendered.payload.filename,
+        retryRendered.payload.mimeType,
+        'retry-1x',
+      )
+      setCompressHint(
+        retryRendered.payload.compressed
+          ? '重试已用 1× 渲染，并按最长边 2560px / 2MB 限制压缩，bbox 已同步映射'
+          : '识别失败页已以 1× 分辨率重试成功，bbox 已同步映射',
+      )
+      return {
+        result,
+        ocrWidth: retryRendered.payload.width,
+        ocrHeight: retryRendered.payload.height,
+      }
+    } catch (err) {
+      return { error: err instanceof Error ? err : firstError }
+    }
+  }
+
+  const applyPageOcrResult = (
+    pageIndex: number,
+    result: OcrPageResult | Error,
+    previewWidth: number,
+    previewHeight: number,
+    ocrWidth: number,
+    ocrHeight: number,
+  ) => {
+    if (result instanceof Error) {
+      dispatch({
+        type: 'UPDATE_OCR_PAGE',
+        fileId: doc.fileId,
+        pageIndex,
+        updates: { status: 'error', error: result.message },
+      })
+      return false
+    }
+
+    const blocks: OcrBlock[] = result.blocks.map((b) => ({
+      ...b,
+      id: uuidv4(),
+      bbox: mapBboxToPreview(b.bbox, ocrWidth, ocrHeight, previewWidth, previewHeight),
+    }))
+    dispatch({
+      type: 'UPDATE_OCR_PAGE',
+      fileId: doc.fileId,
+      pageIndex,
+      updates: {
+        status: 'done',
+        blocks,
+        rawResult: result.rawResult,
+        ocrImageWidth: ocrWidth,
+        ocrImageHeight: ocrHeight,
+        error: undefined,
+      },
+    })
+    return true
   }
 
   const runOcrForPages = async (pageIndices: number[]) => {
@@ -282,119 +341,82 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
     setCompressHint('')
     setProgress({ completed: 0, total: pageIndices.length, failed: 0 })
 
+    let completed = 0
+    let failed = 0
+    const total = pageIndices.length
+
     try {
       if (!mediaReady) {
         throw new Error('文件尚未加载完成，请稍候再试')
       }
 
-      for (const idx of pageIndices) {
+      for (const pageIndex of pageIndices) {
+        setProgress({ completed, total, failed, currentPage: pageIndex })
         dispatch({
           type: 'UPDATE_OCR_PAGE',
           fileId: doc.fileId,
-          pageIndex: idx,
+          pageIndex,
           updates: { status: 'running', error: undefined },
         })
-      }
 
-      const pagesToOcr: {
-        pageIndex: number
-        blob: Blob
-        filename: string
-        mimeType: string
-        previewWidth: number
-        previewHeight: number
-        ocrWidth: number
-        ocrHeight: number
-        compressed: boolean
-      }[] = []
-
-      for (let i = 0; i < pageIndices.length; i++) {
-        const pageIndex = pageIndices[i]
-        setProgress({ completed: i, total: pageIndices.length, failed: 0, currentPage: pageIndex })
-        const rendered = await renderPageForOcr(pageIndex)
-        if (rendered.payload.compressed) {
-          setCompressHint('部分页面已自动压缩以符合上传限制，bbox 已同步映射')
-        }
-        pagesToOcr.push({
-          pageIndex,
-          blob: rendered.payload.blob,
-          filename: rendered.payload.filename,
-          mimeType: rendered.payload.mimeType,
-          previewWidth: rendered.previewWidth,
-          previewHeight: rendered.previewHeight,
-          ocrWidth: rendered.payload.width,
-          ocrHeight: rendered.payload.height,
-          compressed: rendered.payload.compressed,
-        })
-      }
-
-      setProgress({ completed: 0, total: pageIndices.length, failed: 0 })
-      const results = await ocrPagesBatch(
-        pagesToOcr.map(({ pageIndex, blob, filename, mimeType }) => ({
-          pageIndex,
-          blob,
-          filename,
-          mimeType,
-        })),
-        setProgress,
-      )
-
-      for (const item of pagesToOcr) {
-        const { pageIndex, previewWidth, previewHeight } = item
-        let ocrWidth = item.ocrWidth
-        let ocrHeight = item.ocrHeight
-        let result = results.get(pageIndex)
-
-        if (result instanceof Error) {
-          const retried = await retryOcrPage(pageIndex, result)
-          if ('result' in retried) {
-            result = retried.result
-            ocrWidth = retried.ocrWidth
-            ocrHeight = retried.ocrHeight
-          } else {
-            result = retried.error
+        try {
+          const rendered = await renderPageForOcr(pageIndex)
+          if (rendered.payload.compressed) {
+            setCompressHint('部分页面已自动压缩以符合上传限制，bbox 已同步映射')
           }
+
+          const { previewWidth, previewHeight } = rendered
+          let ocrWidth = rendered.payload.width
+          let ocrHeight = rendered.payload.height
+
+          let result: OcrPageResult | Error
+          try {
+            result = await ocrPageBlob(
+              rendered.payload.blob,
+              rendered.payload.filename,
+              rendered.payload.mimeType,
+            )
+          } catch (err) {
+            result = err instanceof Error ? err : new Error('OCR 失败')
+          }
+
+          if (result instanceof Error) {
+            const retried = await retryOcrPage(pageIndex, result)
+            if ('result' in retried) {
+              result = retried.result
+              ocrWidth = retried.ocrWidth
+              ocrHeight = retried.ocrHeight
+            } else {
+              result = retried.error
+            }
+          }
+
+          const ok = applyPageOcrResult(
+            pageIndex,
+            result,
+            previewWidth,
+            previewHeight,
+            ocrWidth,
+            ocrHeight,
+          )
+          if (!ok) failed++
+        } catch (err) {
+          failed++
+          const msg = err instanceof Error ? err.message : 'OCR 识别失败'
+          dispatch({
+            type: 'UPDATE_OCR_PAGE',
+            fileId: doc.fileId,
+            pageIndex,
+            updates: { status: 'error', error: msg },
+          })
         }
 
-        if (result instanceof Error) {
-          dispatch({
-            type: 'UPDATE_OCR_PAGE',
-            fileId: doc.fileId,
-            pageIndex,
-            updates: { status: 'error', error: result.message },
-          })
-        } else if (result) {
-          const blocks: OcrBlock[] = result.blocks.map((b) => ({
-            ...b,
-            id: uuidv4(),
-            bbox: mapBboxToPreview(b.bbox, ocrWidth, ocrHeight, previewWidth, previewHeight),
-          }))
-          dispatch({
-            type: 'UPDATE_OCR_PAGE',
-            fileId: doc.fileId,
-            pageIndex,
-            updates: {
-              status: 'done',
-              blocks,
-              rawResult: result.rawResult,
-              ocrImageWidth: ocrWidth,
-              ocrImageHeight: ocrHeight,
-              error: undefined,
-            },
-          })
-        }
+        completed++
+        setProgress({ completed, total, failed, currentPage: pageIndex })
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'OCR 识别失败'
       setOcrError(msg)
-      for (const idx of pageIndices) {
-        dispatch({
-          type: 'UPDATE_OCR_PAGE',
-          fileId: doc.fileId,
-          pageIndex: idx,
-          updates: { status: 'error', error: msg },
-        })
-      }
     } finally {
       setIsRunning(false)
       setProgress(null)

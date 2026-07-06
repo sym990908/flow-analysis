@@ -18,6 +18,9 @@ export const PDF_NATIVE_SCALE = 2
 
 /** Netlify Function 请求体上限约 6MB，二进制有效约 4.5MB，留安全余量 */
 export const OCR_MAX_BYTES = 3_800_000
+/** 重试 OCR 上传：最长边与体积上限 */
+export const OCR_RETRY_MAX_LONG_EDGE = 2560
+export const OCR_RETRY_MAX_BYTES = 2_000_000
 
 const OPS = {
   save: 10,
@@ -621,15 +624,38 @@ function resizeCanvas(source: HTMLCanvasElement, scaleFactor: number): HTMLCanva
   return canvas
 }
 
+function fitCanvasLongEdge(source: HTMLCanvasElement, maxLongEdge: number) {
+  const long = Math.max(source.width, source.height)
+  if (long <= maxLongEdge) {
+    return { canvas: source, scale: 1, resized: false }
+  }
+  const factor = maxLongEdge / long
+  return {
+    canvas: resizeCanvas(source, factor),
+    scale: factor,
+    resized: true,
+  }
+}
+
 export async function prepareCanvasForOcr(
   source: HTMLCanvasElement,
   filename: string,
   maxBytes = OCR_MAX_BYTES,
-  options?: { forceScale?: number },
+  options?: { forceScale?: number; maxLongEdge?: number; maxBytes?: number },
 ): Promise<OcrImagePayload> {
   let canvas = source
   let renderScale = 1
   let compressed = false
+  const byteLimit = options?.maxBytes ?? maxBytes
+
+  if (options?.maxLongEdge) {
+    const fitted = fitCanvasLongEdge(canvas, options.maxLongEdge)
+    if (fitted.resized) {
+      canvas = fitted.canvas
+      renderScale = fitted.scale
+      compressed = true
+    }
+  }
 
   if (options?.forceScale && options.forceScale < 1) {
     canvas = resizeCanvas(source, options.forceScale)
@@ -649,7 +675,7 @@ export async function prepareCanvasForOcr(
 
     for (const quality of qualities) {
       const blob = await canvasToBlob(canvas, 'image/jpeg', quality)
-      if (blob.size <= maxBytes) {
+      if (blob.size <= byteLimit) {
         return {
           blob,
           filename: filename.replace(/\.(png|jpg|jpeg)$/i, '') + '.jpg',
@@ -664,7 +690,7 @@ export async function prepareCanvasForOcr(
   }
 
   throw new Error(
-    `单页图片过大（>${Math.round(maxBytes / 1024 / 1024)}MB），请拆分 PDF 或降低扫描分辨率后重试`,
+    `单页图片过大（>${Math.round(byteLimit / 1024 / 1024)}MB），请拆分 PDF 或降低扫描分辨率后重试`,
   )
 }
 

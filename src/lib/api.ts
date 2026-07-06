@@ -2,10 +2,34 @@ import type { FilterCriteria, ScenarioType, Transaction } from '../types'
 import type { OcrBlock } from '../types/ocr'
 
 const BASE = '/.netlify/functions'
-const OCR_TIMEOUT_MS = 30_000
+/** 整页 OCR 最长等待（含多轮长轮询） */
+export const OCR_TIMEOUT_MS = 120_000
+/** 提交图片（含上传大图）— 需小于 Netlify ~30s 网关 */
+const OCR_SUBMIT_TIMEOUT_MS = 28_000
+/** 单次长轮询上限（服务端最多等 ~22s） */
+const OCR_LONG_POLL_TIMEOUT_MS = 27_000
+const OCR_POLL_GAP_MS = 200
 
-/** 首次失败后最多 2 次降分辨率重试（相对 2× 渲染原图） */
-export const OCR_RETRY_SCALES = [0.85, 0.7] as const
+/** PDF 首次失败后以 1× 渲染重试一次（首次为 2×） */
+export const OCR_PDF_RETRY_RENDER_SCALE = 1
+
+export interface OcrApiErrorBody {
+  error: string
+  phase?: string
+  elapsedMs?: number
+  jobId?: string
+  attempt?: string
+  filename?: string
+  imageBytes?: number
+}
+
+function formatOcrError(body: OcrApiErrorBody, status: number): string {
+  const parts = [body.error || `HTTP ${status}`]
+  if (body.phase) parts.push(`阶段: ${body.phase}`)
+  if (body.elapsedMs != null) parts.push(`耗时: ${(body.elapsedMs / 1000).toFixed(1)}s`)
+  if (body.jobId) parts.push(`job: ${body.jobId.slice(0, 8)}…`)
+  return parts.join(' · ')
+}
 
 async function post<T>(path: string, body: unknown, timeoutMs?: number): Promise<T> {
   const controller = timeoutMs ? new AbortController() : undefined
@@ -45,40 +69,167 @@ export interface OcrPageResult {
   jobId: string
 }
 
-export async function ocrPageBlob(blob: Blob, filename: string, mimeType = 'image/jpeg') {
+interface OcrSubmitResponse {
+  jobId: string
+  state: 'pending'
+}
+
+interface OcrStatusResponse {
+  state: 'pending' | 'done' | 'failed'
+  jobId: string
+  blocks?: Omit<OcrBlock, 'id'>[]
+  rawResult?: unknown
+  error?: string
+  phase?: string
+  elapsedMs?: number
+  polls?: number
+}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+async function fetchJson<T>(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<{ ok: boolean; status: number; data: T | OcrApiErrorBody }> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), OCR_TIMEOUT_MS)
-
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const res = await fetch(`${BASE}/ocr`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': mimeType,
-        'X-Filename': encodeURIComponent(filename),
-      },
-      body: blob,
-      signal: controller.signal,
-    })
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: res.statusText }))
-      const msg = (err as { error?: string }).error || res.statusText || '请求失败'
-      if (res.status === 404) {
-        throw new Error('后端 API 未找到，请使用 npm run dev:netlify 启动并访问 http://localhost:8888')
-      }
-      if (res.status === 413) {
-        throw new Error(msg)
-      }
-      throw new Error(msg)
-    }
-    return res.json() as Promise<OcrPageResult>
+    const res = await fetch(url, { ...init, signal: controller.signal })
+    const data = (await res.json().catch(() => ({ error: res.statusText }))) as T | OcrApiErrorBody
+    return { ok: res.ok, status: res.status, data }
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error('OCR 请求超时，请重试单页识别')
+      throw new Error(`请求超时（>${timeoutMs / 1000}s）`)
     }
     throw err
   } finally {
     clearTimeout(timer)
+  }
+}
+
+async function pollOcrJob(jobId: string, attempt: string, filename: string): Promise<OcrPageResult> {
+  const pollStarted = performance.now()
+  let rounds = 0
+
+  while (performance.now() - pollStarted < OCR_TIMEOUT_MS) {
+    rounds++
+    const { ok, status, data } = await fetchJson<OcrStatusResponse>(
+      `${BASE}/ocr-status`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId }),
+      },
+      OCR_LONG_POLL_TIMEOUT_MS,
+    )
+
+    if (!ok) {
+      const err = data as OcrApiErrorBody
+      console.warn('[ocr] poll http error', { attempt, filename, jobId, status, round: rounds, ...err })
+      if (status === 502 || status === 504) {
+        await sleep(OCR_POLL_GAP_MS)
+        continue
+      }
+      throw new Error(formatOcrError(err, status))
+    }
+
+    const body = data as OcrStatusResponse
+
+    if (body.state === 'done') {
+      console.info('[ocr] poll done', {
+        attempt,
+        filename,
+        jobId,
+        blocks: body.blocks?.length ?? 0,
+        rounds,
+        elapsed: Math.round(performance.now() - pollStarted),
+      })
+      return {
+        jobId: body.jobId,
+        blocks: body.blocks ?? [],
+        rawResult: body.rawResult,
+      }
+    }
+
+    if (body.state === 'failed') {
+      const msg = formatOcrError(
+        { error: body.error || 'Paddle OCR 任务失败', phase: body.phase, jobId: body.jobId },
+        200,
+      )
+      console.warn('[ocr] paddle failed', { attempt, filename, jobId, error: body.error, rounds })
+      throw new Error(msg)
+    }
+
+    console.info('[ocr] poll pending', {
+      attempt,
+      filename,
+      jobId,
+      rounds,
+      serverMs: body.elapsedMs,
+    })
+    await sleep(OCR_POLL_GAP_MS)
+  }
+
+  throw new Error(`OCR 轮询超时（已等待 ${OCR_TIMEOUT_MS / 1000}s）`)
+}
+
+export async function ocrPageBlob(
+  blob: Blob,
+  filename: string,
+  mimeType = 'image/jpeg',
+  attempt: 'initial' | 'retry-1x' = 'initial',
+) {
+  const started = performance.now()
+
+  try {
+    const submit = await fetchJson<OcrSubmitResponse>(
+      `${BASE}/ocr`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': mimeType,
+          'X-Filename': encodeURIComponent(filename),
+          'X-Ocr-Attempt': attempt,
+        },
+        body: blob,
+      },
+      OCR_SUBMIT_TIMEOUT_MS,
+    )
+
+    const submitElapsed = Math.round(performance.now() - started)
+
+    if (!submit.ok) {
+      const err = submit.data as OcrApiErrorBody
+      const msg = formatOcrError(err, submit.status)
+      console.warn('[ocr] submit failed', { attempt, filename, status: submit.status, submitElapsed, ...err })
+      if (submit.status === 404) {
+        throw new Error('后端 API 未找到，请使用 npm run dev:netlify 启动并访问 http://localhost:8888')
+      }
+      if (submit.status === 502 || submit.status === 504) {
+        throw new Error(`OCR 网关超时 (${submit.status})，请稍后重试单页识别`)
+      }
+      if (submit.status === 413) {
+        throw new Error(msg)
+      }
+      throw new Error(msg)
+    }
+
+    const { jobId } = submit.data as OcrSubmitResponse
+    console.info('[ocr] submitted', { attempt, filename, jobId, submitElapsed, bytes: blob.size })
+
+    const result = await pollOcrJob(jobId, attempt, filename)
+    const elapsed = Math.round(performance.now() - started)
+    console.info('[ocr] ok', { attempt, filename, elapsed, blocks: result.blocks.length, jobId: result.jobId })
+    return result
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('请求超时')) {
+      const elapsed = Math.round(performance.now() - started)
+      console.warn('[ocr] client timeout', { attempt, filename, elapsed, limitMs: OCR_TIMEOUT_MS })
+    }
+    throw err
   }
 }
 

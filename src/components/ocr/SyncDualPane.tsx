@@ -46,9 +46,22 @@ function ViewportPane({
       viewport.applyWheelZoom(side, e.deltaY, e.clientX - rect.left, e.clientY - rect.top)
     }
 
+    const preventDefault = (e: Event) => e.preventDefault()
+
     el.addEventListener('wheel', onWheelNative, { passive: false, capture: true })
-    return () => el.removeEventListener('wheel', onWheelNative, { capture: true })
-  }, [side, viewport.applyWheelZoom])
+    if (suppressSelection) {
+      el.addEventListener('selectstart', preventDefault)
+      el.addEventListener('dragstart', preventDefault)
+    }
+
+    return () => {
+      el.removeEventListener('wheel', onWheelNative, { capture: true })
+      if (suppressSelection) {
+        el.removeEventListener('selectstart', preventDefault)
+        el.removeEventListener('dragstart', preventDefault)
+      }
+    }
+  }, [side, viewport.applyWheelZoom, suppressSelection])
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
@@ -91,9 +104,6 @@ function ViewportPane({
         onPointerMove={(e) => viewport.onPointerMove(side, e)}
         onPointerUp={viewport.onPointerUp}
         onPointerLeave={viewport.onPointerUp}
-        onSelectStart={suppressSelection ? (e) => e.preventDefault() : undefined}
-        onDoubleClick={suppressSelection ? (e) => e.preventDefault() : undefined}
-        onDragStart={suppressSelection ? (e) => e.preventDefault() : undefined}
       >
         <div
           style={{
