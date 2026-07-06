@@ -22,7 +22,7 @@ export const OCR_RENDER_SCALE = 1
 export const OCR_MAX_BYTES = 3_800_000
 /** 失败重试 OCR：最长边与体积上限 */
 export const OCR_RETRY_MAX_LONG_EDGE = 2048
-export const OCR_RETRY_MAX_BYTES = 2_000_000
+export const OCR_RETRY_MAX_BYTES = 1_000_000
 
 const OPS = {
   save: 10,

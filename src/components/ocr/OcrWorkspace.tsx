@@ -3,7 +3,7 @@ import { ArrowLeft, Download, FileJson, AlertCircle } from 'lucide-react'
 import { v4 as uuidv4 } from 'uuid'
 import type { PDFDocumentProxy } from 'pdfjs-dist'
 import { useApp } from '../../store/AppContext'
-import { ocrPageBlob, OCR_PDF_RENDER_SCALE, parseTransactions, inferTableSchema, type OcrBatchProgress, type OcrPageResult } from '../../lib/api'
+import { ocrPageBlob, OCR_PDF_RETRY_RENDER_SCALE, parseTransactions, inferTableSchema, type OcrBatchProgress, type OcrPageResult } from '../../lib/api'
 import {
   loadPdfDocument,
   getCachedPdf,
@@ -33,6 +33,7 @@ import {
   insertTableColumn,
   deleteTableColumn,
   applyInferredHeaders,
+  detectMergeGroupSize,
   parseTableToTransactions,
 } from '../../lib/tableReconstruction'
 import { useTableHistory } from '../../hooks/useTableHistory'
@@ -290,7 +291,7 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
     try {
       console.info('[ocr] retry with compression', { pageIndex: pageIndex + 1, firstError: firstError.message })
       const retryRendered = await renderPageForOcr(pageIndex, {
-        pdfRenderScale: OCR_PDF_RENDER_SCALE,
+        pdfRenderScale: OCR_PDF_RETRY_RENDER_SCALE,
         isRetry: true,
       })
       const result = await ocrPageBlob(
@@ -301,7 +302,7 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
       )
       setCompressHint(
         retryRendered.payload.compressed
-          ? '重试已按最长边 2048px / 2MB 压缩上传，bbox 已同步映射'
+          ? '重试已按最长边 2048px / 1MB 压缩上传，bbox 已同步映射'
           : '识别失败页已重试成功，bbox 已同步映射',
       )
       return {
@@ -519,7 +520,11 @@ export function OcrWorkspace({ document: initialDoc }: Props) {
     setAiLoading(true)
     try {
       const sample = tableToParseContent(table).slice(0, 4000)
-      const { headers } = await inferTableSchema(sample)
+      const mergeGroupSize = detectMergeGroupSize(table, 0)
+      const { headers } = await inferTableSchema(sample, {
+        columnCount: table.columnCount,
+        mergeGroupSize: mergeGroupSize > 1 ? mergeGroupSize : undefined,
+      })
       updateTable(applyInferredHeaders(table, headers))
     } catch {
       alert('AI 辅助识别失败，请手动设置表头')

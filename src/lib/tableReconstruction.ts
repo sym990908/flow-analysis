@@ -420,13 +420,54 @@ export function applyInferredHeaders(
   table: StatementTable,
   headers: string[],
 ): StatementTable {
-  const columnCount = Math.max(table.columnCount, headers.length)
+  const expanded = expandInferredHeaders(headers, table.columnCount, detectMergeGroupSize(table, headers.length))
   return normalizeTable({
     ...table,
-    headers: headers.slice(0, columnCount),
-    columnCount,
+    headers: expanded,
+    columnCount: table.columnCount,
     needsReview: false,
   })
+}
+
+/** 推断合并组大小（行合并后 columnCount = baseColCount × groupSize） */
+export function detectMergeGroupSize(table: StatementTable, inferredHeaderCount: number): number {
+  const fromRows = table.rows.find(
+    (r) => r.mergedRowCount != null && r.mergedRowCount > 1,
+  )?.mergedRowCount
+  if (fromRows && fromRows > 1) return fromRows
+  if (
+    inferredHeaderCount > 0 &&
+    table.columnCount > inferredHeaderCount &&
+    table.columnCount % inferredHeaderCount === 0
+  ) {
+    return table.columnCount / inferredHeaderCount
+  }
+  return 1
+}
+
+/** 将 AI 推断的基础列名按合并组数横向展开至完整 columnCount */
+export function expandInferredHeaders(
+  inferred: string[],
+  columnCount: number,
+  groupSize: number,
+): string[] {
+  if (columnCount <= 0) return []
+
+  const effectiveGroupSize =
+    groupSize > 1 && columnCount % groupSize === 0 ? groupSize : 1
+  const baseColCount =
+    effectiveGroupSize > 1 ? columnCount / effectiveGroupSize : columnCount
+
+  const base = inferred.slice(0, baseColCount).map((h) => h.trim())
+  while (base.length < baseColCount) base.push('')
+
+  if (effectiveGroupSize <= 1) return base.slice(0, columnCount)
+
+  const expanded: string[] = []
+  for (let g = 0; g < effectiveGroupSize; g++) {
+    expanded.push(...base)
+  }
+  return expanded.slice(0, columnCount)
 }
 
 interface ColumnMapping {

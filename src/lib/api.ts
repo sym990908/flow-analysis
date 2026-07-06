@@ -10,8 +10,10 @@ const OCR_SUBMIT_TIMEOUT_MS = 28_000
 const OCR_LONG_POLL_TIMEOUT_MS = 27_000
 const OCR_POLL_GAP_MS = 200
 
-/** PDF 默认 1× OCR；失败重试时压缩至最长边 2048 / 2MB */
+/** PDF 默认 1× OCR */
 export const OCR_PDF_RENDER_SCALE = 1
+/** PDF 失败重试渲染倍率（1× + 压缩） */
+export const OCR_PDF_RETRY_RENDER_SCALE = 1
 
 export interface OcrApiErrorBody {
   error: string
@@ -289,9 +291,14 @@ export async function parseTransactions(
   })
 }
 
-export async function inferTableSchema(sampleText: string) {
+export async function inferTableSchema(
+  sampleText: string,
+  options?: { columnCount?: number; mergeGroupSize?: number },
+) {
   return post<{ headers: string[]; columnMapping?: number[] }>('infer-table-schema', {
     sampleText,
+    columnCount: options?.columnCount,
+    mergeGroupSize: options?.mergeGroupSize,
   })
 }
 

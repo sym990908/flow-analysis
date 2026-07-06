@@ -25,7 +25,7 @@ export function OcrBlockList({ blocks, selectedBlockId, onSelectBlock, onEditBlo
 
   if (blocks.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center px-4 text-center text-lg text-slate-500">
+      <div className="flex h-full items-center justify-center px-4 text-center text-2xl font-medium text-slate-500">
         暂无 OCR 结果，请先识别当前页或选择页范围批量识别
       </div>
     )

@@ -36,7 +36,7 @@ export function OcrTextLayer({
 }: Props) {
   if (blocks.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center text-lg text-slate-500">
+      <div className="flex h-full items-center justify-center text-2xl font-medium text-slate-500">
         暂无 OCR 结果
       </div>
     )
