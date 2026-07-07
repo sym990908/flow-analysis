@@ -1,0 +1,27 @@
+# Supabase 本地开发配置（可选）
+# 详见 https://supabase.com/docs/guides/cli/config
+
+project_id = "flow-analysis"
+
+[api]
+enabled = true
+port = 54321
+
+[db]
+port = 54322
+
+[studio]
+enabled = true
+port = 54323
+
+[auth]
+enabled = true
+site_url = "http://localhost:5180"
+additional_redirect_urls = ["http://localhost:5180", "http://localhost:8888"]
+
+[auth.email]
+enable_signup = true
+enable_confirmations = true
+
+[functions.start-report-job]
+verify_jwt = true

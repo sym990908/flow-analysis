@@ -41,6 +41,7 @@ type Action =
   | { type: 'ADD_REPORT'; report: ScenarioReportRecord }
   | { type: 'SELECT_REPORT'; reportId: string }
   | { type: 'START_REPORT_JOB'; job: ReportJob }
+  | { type: 'UPDATE_REPORT_JOB'; updates: Partial<Pick<ReportJob, 'progress' | 'remoteJobId'>> }
   | { type: 'COMPLETE_REPORT_JOB'; reportId: string }
   | { type: 'FAIL_REPORT_JOB'; error: string }
   | { type: 'CLEAR_REPORT_JOB' }
@@ -170,6 +171,13 @@ function reducer(state: AppState, action: Action): AppState {
     }
     case 'START_REPORT_JOB':
       return { ...state, reportJob: action.job }
+    case 'UPDATE_REPORT_JOB':
+      return {
+        ...state,
+        reportJob: state.reportJob
+          ? { ...state.reportJob, ...action.updates }
+          : undefined,
+      }
     case 'COMPLETE_REPORT_JOB': {
       const report = state.reports.find((r) => r.id === action.reportId)
       return {

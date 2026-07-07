@@ -10,7 +10,18 @@ let client: SupabaseClient | null = null
 export function getSupabase(): SupabaseClient | null {
   if (!isSupabaseConfigured) return null
   if (!client) {
-    client = createClient(url!, key!)
+    client = createClient(url!, key!, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    })
   }
   return client
+}
+
+export function getSupabaseFunctionsUrl(): string | null {
+  if (!url) return null
+  return `${url}/functions/v1`
 }

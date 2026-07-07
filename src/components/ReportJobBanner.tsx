@@ -13,7 +13,8 @@ export function ReportJobBanner() {
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-2 text-sm text-violet-900">
           <span className="flex items-center gap-2">
             <Loader2 size={16} className="animate-spin shrink-0" />
-            正在后台生成场景报告：{reportJobLabel(job)} · 可切换步骤继续操作
+            正在后台生成场景报告：{reportJobLabel(job)}
+            {job.progress != null && job.progress > 0 ? ` · ${job.progress}%` : ''} · 可切换步骤继续操作
           </span>
         </div>
       </div>

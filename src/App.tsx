@@ -1,11 +1,14 @@
 import { useMemo, useState } from 'react'
 import { Scale, Home } from 'lucide-react'
 import { AppProvider, useApp } from './store/AppContext'
+import { AuthProvider, useAuth } from './store/AuthContext'
 import { StepIndicator } from './components/StepIndicator'
 import { ParseJobBanner } from './components/ParseJobBanner'
 import { ReportJobBanner } from './components/ReportJobBanner'
 import { ReportJobRunner } from './components/ReportJobRunner'
 import { ProjectPersistence } from './components/ProjectPersistence'
+import { AuthGate } from './components/auth/AuthGate'
+import { UserMenu } from './components/auth/UserMenu'
 import { Step1Upload } from './pages/Step1Upload'
 import { Step2Structure } from './pages/Step2Structure'
 import { Step3Analysis } from './pages/Step3Analysis'
@@ -14,6 +17,7 @@ import { getStepAccess, getStepStats, stepBlockedReason } from './lib/stepNaviga
 
 function AppContent() {
   const { state, dispatch } = useApp()
+  const { configured: supabaseConfigured } = useAuth()
   const [blockedHint, setBlockedHint] = useState<string | null>(null)
   const onHome = isProjectHome(state)
   const access = useMemo(() => getStepAccess(state), [state])
@@ -43,7 +47,9 @@ function AppContent() {
             </div>
             <div>
               <h1 className="text-lg font-bold text-slate-900">Flow Analysis</h1>
-              <p className="text-xs text-slate-500">进度与报告自动保存到本地</p>
+              <p className="text-xs text-slate-500">
+                {supabaseConfigured ? '登录后项目与报告同步云端' : '进度与报告自动保存到本地'}
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -52,6 +58,7 @@ function AppContent() {
               onChange={(e) => dispatch({ type: 'SET_PROJECT_NAME', name: e.target.value })}
               className="hidden rounded border border-slate-200 px-3 py-1 text-sm sm:block"
             />
+            <UserMenu />
             {!onHome && (
               <button
                 type="button"
@@ -86,8 +93,12 @@ function AppContent() {
 
 export default function App() {
   return (
-    <AppProvider>
-      <AppContent />
-    </AppProvider>
+    <AuthProvider>
+      <AuthGate>
+        <AppProvider>
+          <AppContent />
+        </AppProvider>
+      </AuthGate>
+    </AuthProvider>
   )
 }

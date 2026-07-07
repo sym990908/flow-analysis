@@ -90,8 +90,11 @@ export type ScenarioReportRecord = ScenarioReport & {
 
 export interface ReportJob {
   id: string
+  /** Supabase 异步任务 ID（配置 Supabase 时使用） */
+  remoteJobId?: string
   scenario: ScenarioType
   status: 'running' | 'done' | 'error'
+  progress?: number
   error?: string
   reportId?: string
   scopeSnapshot: ReportScopeSnapshot

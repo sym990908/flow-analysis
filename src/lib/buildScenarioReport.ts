@@ -2,6 +2,12 @@ import { v4 as uuidv4 } from 'uuid'
 import { analyzeScenario } from './api'
 import { detectRisks, tagByScenario } from './riskEngine'
 import { getScopeSummary } from './analysisScope'
+import type { LlmReportPayload } from './reportJobTypes'
+import {
+  createRemoteReportJob,
+  pollRemoteReportJob,
+  shouldUseRemoteReportJobs,
+} from './supabaseReportJobs'
 import type { AppState, ReportJob, ScenarioReportRecord, Transaction } from '../types'
 import { SCENARIO_LABELS } from '../types'
 
@@ -15,11 +21,12 @@ export function prepareTransactionsForReport(
   return txs
 }
 
-export async function buildScenarioReportRecord(
+function buildRecordFromLlmResult(
   state: AppState,
   processedForReport: Transaction[],
-  job?: ReportJob,
-): Promise<ScenarioReportRecord> {
+  job: ReportJob | undefined,
+  result: LlmReportPayload,
+): ScenarioReportRecord {
   const scenario = job?.scenario ?? state.scenario
   const scope = job?.scopeSnapshot
     ? {
@@ -29,12 +36,6 @@ export async function buildScenarioReportRecord(
     : state.analysisScope
 
   const summary = getScopeSummary(scope, state.files, state.transactions)
-  const result = await analyzeScenario(
-    processedForReport,
-    scenario,
-    state.subjects.map((s) => ({ name: s.name, accounts: s.accounts })),
-  )
-
   const keyTxs = processedForReport
     .filter((t) => result.keyTransactionIds?.includes(t.id) || t.isRisk)
     .slice(0, 20)
@@ -56,13 +57,53 @@ export async function buildScenarioReportRecord(
     recommendations: result.recommendations,
     generatedAt: new Date().toISOString(),
     analyzedFileNames: summary.labels,
-    scopeSnapshot: {
+    scopeSnapshot: job?.scopeSnapshot ?? {
       mode: scope.mode,
       selectedFileIds: [...scope.selectedFileIds],
       fileLabels: summary.labels,
       txCount: processedForReport.length,
     },
   }
+}
+
+export async function buildScenarioReportRecord(
+  state: AppState,
+  processedForReport: Transaction[],
+  job?: ReportJob,
+  onProgress?: (progress: number) => void,
+): Promise<ScenarioReportRecord> {
+  const scenario = job?.scenario ?? state.scenario
+
+  if (shouldUseRemoteReportJobs() && job) {
+    onProgress?.(10)
+    const { jobId } = await createRemoteReportJob({
+      projectId: state.projectId,
+      scenario,
+      scopeSnapshot: job.scopeSnapshot,
+      transactions: processedForReport,
+      subjects: state.subjects.map((s) => ({ name: s.name, accounts: s.accounts })),
+    })
+
+    const remote = await pollRemoteReportJob(jobId, {
+      intervalMs: 3000,
+      timeoutMs: 180_000,
+    })
+    onProgress?.(remote.progress)
+
+    if (!remote.result) {
+      throw new Error('报告结果为空')
+    }
+
+    return buildRecordFromLlmResult(state, processedForReport, { ...job, remoteJobId: jobId }, remote.result)
+  }
+
+  const result = await analyzeScenario(
+    processedForReport,
+    scenario,
+    state.subjects.map((s) => ({ name: s.name, accounts: s.accounts })),
+  )
+
+  return buildRecordFromLlmResult(state, processedForReport, job, result)
 }
 
 export function reportJobLabel(job: ReportJob): string {

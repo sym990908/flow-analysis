@@ -31,6 +31,13 @@ export function ReportJobRunner() {
           { ...state, scenario: job.scenario, analysisScope: scope },
           processed,
           job,
+          (progress) => {
+            if (cancelled) return
+            dispatch({
+              type: 'UPDATE_REPORT_JOB',
+              updates: { progress },
+            })
+          },
         )
         if (cancelled) return
         dispatch({ type: 'ADD_REPORT', report })
