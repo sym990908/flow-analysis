@@ -42,6 +42,7 @@ type Action =
   | { type: 'SELECT_REPORT'; reportId: string }
   | { type: 'START_REPORT_JOB'; job: ReportJob }
   | { type: 'UPDATE_REPORT_JOB'; updates: Partial<Pick<ReportJob, 'progress' | 'remoteJobId'>> }
+  | { type: 'CLEAR_STUCK_REPORT_JOB' }
   | { type: 'COMPLETE_REPORT_JOB'; reportId: string }
   | { type: 'FAIL_REPORT_JOB'; error: string }
   | { type: 'CLEAR_REPORT_JOB' }
@@ -197,6 +198,8 @@ function reducer(state: AppState, action: Action): AppState {
           : undefined,
       }
     case 'CLEAR_REPORT_JOB':
+      return { ...state, reportJob: undefined }
+    case 'CLEAR_STUCK_REPORT_JOB':
       return { ...state, reportJob: undefined }
     case 'LOAD_PROJECT':
       return stateFromSnapshot(action.snapshot)

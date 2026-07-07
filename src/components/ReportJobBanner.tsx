@@ -14,8 +14,15 @@ export function ReportJobBanner() {
           <span className="flex items-center gap-2">
             <Loader2 size={16} className="animate-spin shrink-0" />
             正在后台生成场景报告：{reportJobLabel(job)}
-            {job.progress != null && job.progress > 0 ? ` · ${job.progress}%` : ''} · 可切换步骤继续操作
+            {job.progress != null && job.progress > 0 ? ` · ${job.progress}%` : ''} · 通常需 1–3 分钟
           </span>
+          <button
+            type="button"
+            onClick={() => dispatch({ type: 'CLEAR_STUCK_REPORT_JOB' })}
+            className="shrink-0 rounded border border-violet-300 px-2 py-0.5 text-xs hover:bg-violet-100"
+          >
+            取消等待
+          </button>
         </div>
       </div>
     )

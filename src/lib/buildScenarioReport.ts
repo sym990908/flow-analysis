@@ -71,12 +71,13 @@ export async function buildScenarioReportRecord(
   processedForReport: Transaction[],
   job?: ReportJob,
   onProgress?: (progress: number) => void,
+  onRemoteJobCreated?: (remoteJobId: string) => void,
 ): Promise<ScenarioReportRecord> {
   const scenario = job?.scenario ?? state.scenario
 
   if (shouldUseRemoteReportJobs() && job) {
     onProgress?.(10)
-    const { jobId } = await createRemoteReportJob({
+    const created = await createRemoteReportJob({
       projectId: state.projectId,
       scenario,
       scopeSnapshot: job.scopeSnapshot,
@@ -84,9 +85,22 @@ export async function buildScenarioReportRecord(
       subjects: state.subjects.map((s) => ({ name: s.name, accounts: s.accounts })),
     })
 
-    const remote = await pollRemoteReportJob(jobId, {
+    onRemoteJobCreated?.(created.jobId)
+    onProgress?.(created.result ? 95 : 20)
+
+    if (created.result) {
+      return buildRecordFromLlmResult(
+        state,
+        processedForReport,
+        { ...job, remoteJobId: created.jobId },
+        created.result,
+      )
+    }
+
+    const remote = await pollRemoteReportJob(created.jobId, {
       intervalMs: 3000,
-      timeoutMs: 180_000,
+      timeoutMs: 600_000,
+      onProgress,
     })
     onProgress?.(remote.progress)
 
@@ -94,7 +108,12 @@ export async function buildScenarioReportRecord(
       throw new Error('报告结果为空')
     }
 
-    return buildRecordFromLlmResult(state, processedForReport, { ...job, remoteJobId: jobId }, remote.result)
+    return buildRecordFromLlmResult(
+      state,
+      processedForReport,
+      { ...job, remoteJobId: created.jobId },
+      remote.result,
+    )
   }
 
   const result = await analyzeScenario(

@@ -1,9 +1,12 @@
 import type { FilterCriteria, ScenarioType, Transaction } from '../types'
 import type { OcrBlock } from '../types/ocr'
+import { isSupabaseOcrAvailable, pollRemoteOcrJob, submitRemoteOcrJob } from './supabaseOcrJobs'
 
 const BASE = '/.netlify/functions'
 /** 整页 OCR 最长等待（含多轮长轮询） */
 export const OCR_TIMEOUT_MS = 120_000
+/** Supabase 后台最长 140s，客户端多留余量 */
+export const SUPABASE_OCR_TIMEOUT_MS = 150_000
 /** 提交图片（含上传大图）— 需小于 Netlify ~30s 网关 */
 const OCR_SUBMIT_TIMEOUT_MS = 28_000
 /** 单次长轮询上限（服务端最多等 ~22s） */
@@ -179,6 +182,55 @@ async function pollOcrJob(jobId: string, attempt: string, filename: string): Pro
 }
 
 export async function ocrPageBlob(
+  blob: Blob,
+  filename: string,
+  mimeType = 'image/jpeg',
+  attempt: 'initial' | 'retry-1x' = 'initial',
+) {
+  if (await isSupabaseOcrAvailable()) {
+    return ocrPageViaSupabase(blob, filename, mimeType, attempt)
+  }
+  return ocrPageViaNetlify(blob, filename, mimeType, attempt)
+}
+
+async function ocrPageViaSupabase(
+  blob: Blob,
+  filename: string,
+  mimeType: string,
+  attempt: 'initial' | 'retry-1x',
+) {
+  const started = performance.now()
+  const submitted = await submitRemoteOcrJob(blob, filename, mimeType, attempt)
+  console.info('[ocr] supabase submitted', { attempt, filename, jobId: submitted.jobId, bytes: blob.size })
+
+  if (submitted.blocks) {
+    const elapsed = Math.round(performance.now() - started)
+    console.info('[ocr] supabase ok (sync)', { attempt, filename, elapsed, blocks: submitted.blocks.length })
+    return {
+      jobId: submitted.jobId,
+      blocks: submitted.blocks,
+      rawResult: submitted.rawResult,
+    }
+  }
+
+  const row = await pollRemoteOcrJob(submitted.jobId, {
+    intervalMs: 2000,
+    timeoutMs: SUPABASE_OCR_TIMEOUT_MS,
+    onProgress: (p) => console.info('[ocr] supabase progress', { jobId: submitted.jobId, progress: p }),
+  })
+
+  const elapsed = Math.round(performance.now() - started)
+  const blocks = row.result?.blocks ?? []
+  console.info('[ocr] supabase ok', { attempt, filename, elapsed, blocks: blocks.length, jobId: submitted.jobId })
+
+  return {
+    jobId: submitted.jobId,
+    blocks,
+    rawResult: row.result?.rawResult,
+  }
+}
+
+async function ocrPageViaNetlify(
   blob: Blob,
   filename: string,
   mimeType = 'image/jpeg',

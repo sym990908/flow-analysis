@@ -186,11 +186,18 @@ Deno.serve(async (req) => {
     })
   }
 
+  const startedAt = Date.now()
+  let jobId: string | undefined
+
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!
     const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!
     const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
     const siliconflowKey = Deno.env.get('SILICONFLOW_API_KEY') || ''
+
+    if (!siliconflowKey) {
+      console.warn('[start-report-job] SILICONFLOW_API_KEY 未配置，将使用 fallback 报告')
+    }
 
     const authHeader = req.headers.get('Authorization')
     if (!authHeader) {
@@ -236,6 +243,12 @@ Deno.serve(async (req) => {
       })
     }
 
+    console.log('[start-report-job] create', {
+      userId: user.id,
+      scenario,
+      txCount: transactions.length,
+    })
+
     const admin = createClient(supabaseUrl, serviceRoleKey)
 
     const { data: job, error: insertError } = await admin
@@ -244,8 +257,8 @@ Deno.serve(async (req) => {
         user_id: user.id,
         project_id: projectId || null,
         scenario,
-        status: 'pending',
-        progress: 5,
+        status: 'running',
+        progress: 20,
         scope_snapshot: scopeSnapshot,
         payload: { transactions, subjects },
       })
@@ -253,51 +266,61 @@ Deno.serve(async (req) => {
       .single()
 
     if (insertError || !job) {
+      console.error('[start-report-job] insert failed', insertError)
       return new Response(JSON.stringify({ error: insertError?.message || '创建任务失败' }), {
         status: 500,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
 
-    const processJob = async () => {
-      await admin.from('report_jobs').update({ status: 'running', progress: 20 }).eq('id', job.id)
-      try {
-        const result = await generateScenarioReport(
-          siliconflowKey,
-          scenario,
-          transactions,
-          subjects.map((s) => ({ name: s.name })),
-        )
-        await admin
-          .from('report_jobs')
-          .update({ status: 'done', progress: 100, result, error: null })
-          .eq('id', job.id)
-      } catch (err) {
-        await admin
-          .from('report_jobs')
-          .update({
-            status: 'error',
-            progress: 100,
-            error: err instanceof Error ? err.message : '报告生成失败',
-          })
-          .eq('id', job.id)
-      }
-    }
+    jobId = job.id
+    console.log('[start-report-job] LLM start', { jobId, elapsedMs: Date.now() - startedAt })
 
-    // @ts-expect-error Supabase Edge Runtime 注入
-    EdgeRuntime.waitUntil(processJob())
+    const result = await generateScenarioReport(
+      siliconflowKey,
+      scenario,
+      transactions,
+      subjects.map((s) => ({ name: s.name })),
+    )
 
-    return new Response(JSON.stringify({ jobId: job.id, status: 'pending' }), {
-      status: 202,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    })
-  } catch (err) {
+    console.log('[start-report-job] LLM done', { jobId, elapsedMs: Date.now() - startedAt })
+
+    await admin
+      .from('report_jobs')
+      .update({ status: 'done', progress: 100, result, error: null })
+      .eq('id', job.id)
+
+    console.log('[start-report-job] complete', { jobId, elapsedMs: Date.now() - startedAt })
+
     return new Response(
-      JSON.stringify({ error: err instanceof Error ? err.message : '服务器错误' }),
+      JSON.stringify({ jobId: job.id, status: 'done', result }),
       {
-        status: 500,
+        status: 200,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       },
     )
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '服务器错误'
+    console.error('[start-report-job] error', { jobId, message, elapsedMs: Date.now() - startedAt })
+
+    if (jobId) {
+      try {
+        const admin = createClient(
+          Deno.env.get('SUPABASE_URL')!,
+          Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+        )
+        await admin
+          .from('report_jobs')
+          .update({ status: 'error', progress: 100, error: message })
+          .eq('id', jobId)
+      } catch {
+        // ignore
+      }
+    }
+
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
   }
 })
