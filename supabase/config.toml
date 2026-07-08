@@ -25,3 +25,6 @@ enable_confirmations = true
 
 [functions.start-report-job]
 verify_jwt = true
+
+[functions.start-ocr-job]
+verify_jwt = true

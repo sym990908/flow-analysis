@@ -1,7 +1,9 @@
 /**
  * Supabase Dashboard → Edge Functions → Via Editor
  * 函数名：start-ocr-job
- * 同步执行 OCR（不用 waitUntil），避免后台任务 ~75s 被终止
+ *
+ * 浏览器先将图片上传到 Storage，再 POST JSON { jobId, storagePath, ... }。
+ * 本函数从 Storage 读取后调 Paddle，HTTP 响应只返回 jobId（结果在 ocr_jobs 表）。
  *
  * Secrets：PADDLEOCR_TOKEN
  */
@@ -12,11 +14,11 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-filename, x-ocr-attempt',
 }
 
+const OCR_SOURCE_BUCKET = 'ocr-sources'
 const JOB_URL = 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs'
 const MODEL = 'PP-OCRv6'
 const MAX_BODY_BYTES = 5_500_000
 const POLL_INTERVAL_MS = 800
-/** 单次请求内最长轮询 Paddle（免费档 wall clock 150s） */
 const MAX_POLL_MS = 140_000
 
 const optionalPayload = {
@@ -41,6 +43,13 @@ interface OcrBlockResult {
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+function assertStoragePathForUser(storagePath: string, userId: string) {
+  const prefix = `${userId}/`
+  if (!storagePath.startsWith(prefix) || storagePath.includes('..')) {
+    throw new Error('非法 storagePath')
+  }
 }
 
 function normalizePoly(poly: unknown): [number, number][] {
@@ -233,27 +242,76 @@ Deno.serve(async (req) => {
     }
 
     const contentType = req.headers.get('content-type') || ''
-    const filename = decodeURIComponent(req.headers.get('x-filename') || 'page.jpg')
-    let buffer: Uint8Array
-    let mimeType: string
-
-    if (contentType.includes('application/json')) {
-      const { base64, filename: fn, mimeType: mt } = await req.json()
-      if (!base64) {
-        return new Response(JSON.stringify({ error: '缺少文件数据' }), {
-          status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        })
-      }
-      buffer = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
-      mimeType = mt || 'image/jpeg'
-    } else {
-      buffer = new Uint8Array(await req.arrayBuffer())
-      mimeType = contentType || 'image/jpeg'
+    if (!contentType.includes('application/json')) {
+      return new Response(
+        JSON.stringify({
+          error: '请先将图片上传到 Supabase Storage，再以 JSON 提交 storagePath',
+          phase: 'upload',
+        }),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+      )
     }
 
+    const body = await req.json()
+    const {
+      jobId: clientJobId,
+      storagePath,
+      filename = 'page.jpg',
+      mimeType = 'image/jpeg',
+    } = body as {
+      jobId?: string
+      storagePath?: string
+      filename?: string
+      mimeType?: string
+    }
+
+    if (!clientJobId || !storagePath) {
+      return new Response(JSON.stringify({ error: '缺少 jobId 或 storagePath' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    assertStoragePathForUser(storagePath, user.id)
+    jobId = clientJobId
+
+    const admin = createClient(supabaseUrl, serviceRoleKey)
+
+    const { data: existingJob, error: jobFetchError } = await admin
+      .from('ocr_jobs')
+      .select('id, user_id, status')
+      .eq('id', jobId)
+      .maybeSingle()
+
+    if (jobFetchError || !existingJob) {
+      return new Response(JSON.stringify({ error: 'OCR 任务不存在' }), {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    if (existingJob.user_id !== user.id) {
+      return new Response(JSON.stringify({ error: '无权访问该 OCR 任务' }), {
+        status: 403,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const { data: fileBlob, error: downloadError } = await admin.storage
+      .from(OCR_SOURCE_BUCKET)
+      .download(storagePath)
+
+    if (downloadError || !fileBlob) {
+      return new Response(JSON.stringify({ error: downloadError?.message || '读取 Storage 失败', phase: 'download' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    const buffer = new Uint8Array(await fileBlob.arrayBuffer())
+
     if (buffer.length === 0) {
-      return new Response(JSON.stringify({ error: '请求体为空' }), {
+      return new Response(JSON.stringify({ error: 'Storage 文件为空' }), {
         status: 400,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
@@ -262,41 +320,20 @@ Deno.serve(async (req) => {
     if (buffer.length > MAX_BODY_BYTES) {
       return new Response(
         JSON.stringify({
-          error: `图片过大 (${(buffer.length / 1024 / 1024).toFixed(1)}MB)，请压缩后重试`,
+          error: `图片过大 (${(buffer.length / 1024 / 1024).toFixed(1)}MB)`,
           phase: 'submit',
           imageBytes: buffer.length,
         }),
-        {
-          status: 413,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        },
+        { status: 413, headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
       )
     }
 
-    console.log('[start-ocr-job] create', { userId: user.id, filename, bytes: buffer.length })
+    console.log('[start-ocr-job] from storage', { jobId, userId: user.id, filename, bytes: buffer.length, storagePath })
 
-    const admin = createClient(supabaseUrl, serviceRoleKey)
-
-    const { data: job, error: insertError } = await admin
+    await admin
       .from('ocr_jobs')
-      .insert({
-        user_id: user.id,
-        filename,
-        image_bytes: buffer.length,
-        status: 'running',
-        progress: 10,
-      })
-      .select('id')
-      .single()
-
-    if (insertError || !job) {
-      return new Response(JSON.stringify({ error: insertError?.message || '创建 OCR 任务失败' }), {
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      })
-    }
-
-    jobId = job.id
+      .update({ status: 'running', progress: 15, image_bytes: buffer.length, storage_path: storagePath, filename })
+      .eq('id', jobId)
 
     const result = await runOcrPipeline(paddleToken, buffer, filename, mimeType, async (progress, paddleJobId) => {
       await admin
@@ -305,7 +342,7 @@ Deno.serve(async (req) => {
           progress,
           ...(paddleJobId ? { paddle_job_id: paddleJobId } : {}),
         })
-        .eq('id', job.id)
+        .eq('id', jobId!)
     })
 
     await admin
@@ -318,24 +355,14 @@ Deno.serve(async (req) => {
         error: null,
         phase: null,
       })
-      .eq('id', job.id)
+      .eq('id', jobId)
 
     console.log('[start-ocr-job] complete', { jobId, elapsedMs: Date.now() - startedAt })
 
-    return new Response(
-      JSON.stringify({
-        jobId: job.id,
-        state: 'done',
-        filename,
-        imageBytes: buffer.length,
-        blocks: result.blocks,
-        rawResult: result.rawResults,
-      }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      },
-    )
+    return new Response(JSON.stringify({ jobId, status: 'done' }), {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'OCR 失败'
     const phase = message.includes('提交') ? 'submit' : message.includes('下载') ? 'download' : 'poll'
