@@ -31,9 +31,18 @@ export interface SubmitRemoteOcrJobResult {
   rawResult?: unknown
 }
 
-function sanitizeStorageFilename(filename: string): string {
+/** Storage object key 仅允许 ASCII，中文等字符会导致 InvalidKey */
+function storageObjectName(filename: string, mimeType: string): string {
+  const extMatch = filename.match(/\.([a-zA-Z0-9]{1,8})$/i)
+  if (extMatch) return `source.${extMatch[1].toLowerCase()}`
+  if (mimeType.includes('png')) return 'source.png'
+  if (mimeType.includes('webp')) return 'source.webp'
+  return 'source.jpg'
+}
+
+function displayFilename(filename: string): string {
   const base = filename.split(/[/\\]/).pop() || 'page.jpg'
-  return base.replace(/[^\w.\-()+\u4e00-\u9fff]/g, '_').slice(0, 120) || 'page.jpg'
+  return base.slice(0, 255) || 'page.jpg'
 }
 
 /**
@@ -67,13 +76,14 @@ export async function submitRemoteOcrJob(
   if (!user) throw new Error('请先登录后再使用 OCR')
 
   const jobId = uuidv4()
-  const safeName = sanitizeStorageFilename(filename)
-  const storagePath = `${user.id}/${jobId}/${safeName}`
+  const originalName = displayFilename(filename)
+  const objectName = storageObjectName(filename, mimeType)
+  const storagePath = `${user.id}/${jobId}/${objectName}`
 
   const { error: insertError } = await supabase.from('ocr_jobs').insert({
     id: jobId,
     user_id: user.id,
-    filename: safeName,
+    filename: originalName,
     image_bytes: blob.size,
     storage_path: storagePath,
     status: 'pending',
@@ -115,7 +125,7 @@ export async function submitRemoteOcrJob(
       body: JSON.stringify({
         jobId,
         storagePath,
-        filename: safeName,
+        filename: originalName,
         mimeType: mimeType || 'image/jpeg',
         attempt,
       }),
